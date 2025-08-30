@@ -1136,8 +1136,6 @@ export class IncomingMessageForClient extends NodeReadable {
     }
     const buf = new Uint8Array(64 * 1024);
 
-    const buf = new Uint8Array(16 * 1024);
-
     const pump = () => {
       if (this.destroyed) return;
 
