@@ -448,6 +448,30 @@ Deno.test("[node/http2 client] connection states", async () => {
   assertEquals(actual, expected);
 });
 
+Deno.test("[node/http2] emits one data event per frame", {
+  ignore: Deno.build.os === "windows",
+}, async () => {
+  const server = http2.createServer();
+  server.on("stream", (stream) => {
+    for (let i = 0; i < 5; i++) stream.write(String(i));
+    stream.end();
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address() as { port: number };
+  const client = http2.connect(`http://127.0.0.1:${port}`);
+  const req = client.request({ ":path": "/" });
+  const received: string[] = [];
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => received.push(chunk));
+  const endPromise = Promise.withResolvers<void>();
+  req.on("end", () => endPromise.resolve());
+  req.end();
+  await endPromise.promise;
+  client.close();
+  await new Promise((resolve) => server.close(resolve));
+  assertEquals(received, ["0", "1", "2", "3", "4"]);
+});
+
 Deno.test("request and response exports", () => {
   assert(http2.Http2ServerRequest);
   assert(http2.Http2ServerResponse);

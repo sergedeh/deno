@@ -547,6 +547,7 @@ class ClientRequest extends OutgoingMessage {
           this._bodyWriteRid,
           baseConnRid,
           this._encrypted,
+          true,
         );
         this._flushBuffer();
 
@@ -1133,6 +1134,7 @@ export class IncomingMessageForClient extends NodeReadable {
       this._readableState.readingMore = false;
       this._consuming = true;
     }
+    const buf = new Uint8Array(64 * 1024);
 
     const buf = new Uint8Array(16 * 1024);
 
