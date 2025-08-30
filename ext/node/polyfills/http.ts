@@ -1136,13 +1136,27 @@ export class IncomingMessageForClient extends NodeReadable {
 
     const buf = new Uint8Array(16 * 1024);
 
-    core.read(this._bodyRid, buf).then((bytesRead) => {
-      if (bytesRead === 0) {
-        this.push(null);
-      } else {
-        this.push(Buffer.from(buf.subarray(0, bytesRead)));
-      }
-    });
+    const pump = () => {
+      if (this.destroyed) return;
+
+      core.read(this._bodyRid, buf).then(
+        (bytesRead) => {
+          if (this.destroyed) return;
+          if (bytesRead === 0) {
+            this.push(null);
+          } else if (this.push(Buffer.from(buf.subarray(0, bytesRead)))) {
+            if (this.destroyed) return;
+            pump();
+          }
+        },
+        (err) => {
+          if (this.destroyed) return;
+          this.destroy(err);
+        },
+      );
+    };
+
+    pump();
   }
 
   // It's possible that the socket will be destroyed, and removed from
