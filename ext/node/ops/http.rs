@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
 use deno_core::BufView;
@@ -85,12 +85,14 @@ pub struct NodeHttpClientResponse {
   response: Pin<Box<dyn Future<Output = CancelableResponseResult>>>,
   url: String,
   informational_rx: RefCell<Option<mpsc::Receiver<InformationalResponse>>>,
+  frame_aligned: bool,
 }
 
 impl Debug for NodeHttpClientResponse {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("NodeHttpClientResponse")
       .field("url", &self.url)
+      .field("frame_aligned", &self.frame_aligned)
       .finish()
   }
 }
@@ -165,6 +167,7 @@ pub async fn op_node_http_request_with_conn<P>(
   #[smi] body: Option<ResourceId>,
   #[smi] conn_rid: ResourceId,
   encrypted: bool,
+  frame_aligned: bool,
 ) -> Result<FetchReturn, ConnError>
 where
   P: crate::NodePermissions + 'static,
@@ -360,6 +363,7 @@ where
       response: Box::pin(fut),
       url: url.clone(),
       informational_rx: RefCell::new(Some(informational_rx)),
+      frame_aligned,
     });
 
   let cancel_handle_rid = state
@@ -412,6 +416,7 @@ pub async fn op_node_http_await_response(
   })?;
 
   let res = resource.response.await??;
+  let frame_aligned = resource.frame_aligned;
   let status = res.status();
   let mut res_headers = Vec::new();
   for (key, val) in res.headers().iter() {
@@ -435,10 +440,15 @@ pub async fn op_node_http_await_response(
 
   let res = http::Response::from_parts(parts, body);
 
-  let response_rid = state
-    .borrow_mut()
-    .resource_table
-    .add(NodeHttpResponseResource::new(res, content_length));
+  let response_rid =
+    state
+      .borrow_mut()
+      .resource_table
+      .add(NodeHttpResponseResource::new(
+        res,
+        content_length,
+        frame_aligned,
+      ));
 
   Ok(NodeHttpResponse {
     status: status.as_u16(),
@@ -572,6 +582,7 @@ type BytesStream =
 pub enum NodeHttpFetchResponseReader {
   Start(http::Response<ResBody>),
   BodyReader(Peekable<BytesStream>),
+  FrameReader(ResBody),
 }
 
 impl Default for NodeHttpFetchResponseReader {
@@ -586,16 +597,24 @@ pub struct NodeHttpResponseResource {
   pub response_reader: AsyncRefCell<NodeHttpFetchResponseReader>,
   pub cancel: CancelHandle,
   pub size: Option<u64>,
+  pub frame_aligned: bool,
+  pub pending: RefCell<BytesMut>,
 }
 
 impl NodeHttpResponseResource {
-  pub fn new(response: http::Response<ResBody>, size: Option<u64>) -> Self {
+  pub fn new(
+    response: http::Response<ResBody>,
+    size: Option<u64>,
+    frame_aligned: bool,
+  ) -> Self {
     Self {
       response_reader: AsyncRefCell::new(NodeHttpFetchResponseReader::Start(
         response,
       )),
       cancel: CancelHandle::default(),
       size,
+      frame_aligned,
+      pending: RefCell::new(BytesMut::new()),
     }
   }
 
@@ -620,52 +639,112 @@ impl Resource for NodeHttpResponseResource {
       let mut reader =
         RcRef::map(&self, |r| &r.response_reader).borrow_mut().await;
 
-      let body = loop {
-        match &mut *reader {
-          NodeHttpFetchResponseReader::BodyReader(reader) => break reader,
-          NodeHttpFetchResponseReader::Start(_) => {}
-        }
-
-        match std::mem::take(&mut *reader) {
-          NodeHttpFetchResponseReader::Start(resp) => {
-            let stream: BytesStream = Box::pin(
-              resp
-                .into_body()
-                .into_data_stream()
-                .map(|r| r.map_err(std::io::Error::other)),
-            );
-            *reader =
-              NodeHttpFetchResponseReader::BodyReader(stream.peekable());
+      if self.frame_aligned {
+        let body = loop {
+          match &mut *reader {
+            NodeHttpFetchResponseReader::FrameReader(body) => break body,
+            NodeHttpFetchResponseReader::Start(_) => {}
+            NodeHttpFetchResponseReader::BodyReader(_) => unreachable!(),
           }
-          NodeHttpFetchResponseReader::BodyReader(_) => unreachable!(),
-        }
-      };
-      let fut = async move {
-        let mut reader = Pin::new(body);
-        loop {
-          match reader.as_mut().peek_mut().await {
-            Some(Ok(chunk)) if !chunk.is_empty() => {
-              let len = min(limit, chunk.len());
-              let chunk = chunk.split_to(len);
-              break Ok(chunk.into());
+
+          match std::mem::take(&mut *reader) {
+            NodeHttpFetchResponseReader::Start(resp) => {
+              *reader =
+                NodeHttpFetchResponseReader::FrameReader(resp.into_body());
             }
-            // This unwrap is safe because `peek_mut()` returned `Some`, and thus
-            // currently has a peeked value that can be synchronously returned
-            // from `next()`.
-            //
-            // The future returned from `next()` is always ready, so we can
-            // safely call `await` on it without creating a race condition.
-            Some(_) => match reader.as_mut().next().await.unwrap() {
-              Ok(chunk) => assert!(chunk.is_empty()),
-              Err(err) => break Err(JsErrorBox::type_error(err.to_string())),
-            },
-            None => break Ok(BufView::empty()),
+            NodeHttpFetchResponseReader::FrameReader(_) => unreachable!(),
+            NodeHttpFetchResponseReader::BodyReader(_) => unreachable!(),
+          }
+        };
+
+        {
+          let mut pending = self.pending.borrow_mut();
+          if !pending.is_empty() {
+            let len = min(limit, pending.len());
+            let chunk = pending.split_to(len).freeze();
+            return Ok(chunk.into());
           }
         }
-      };
 
-      let cancel_handle = RcRef::map(self, |r| &r.cancel);
-      fut.try_or_cancel(cancel_handle).await
+        let fut = async {
+          loop {
+            match body.frame().await {
+              Some(Ok(frame)) => {
+                if let Ok(bytes) = frame.into_data() {
+                  return Ok(bytes);
+                }
+              }
+              Some(Err(err)) => {
+                return Err(JsErrorBox::type_error(err.to_string()));
+              }
+              None => return Ok(Bytes::new()),
+            }
+          }
+        };
+
+        let cancel_handle = RcRef::map(self.clone(), |r| &r.cancel);
+        let mut bytes: Bytes = fut.try_or_cancel(cancel_handle).await?;
+        drop(reader);
+        if bytes.is_empty() {
+          Ok(BufView::empty())
+        } else if bytes.len() > limit {
+          let mut pending = self.pending.borrow_mut();
+          let chunk = bytes.split_to(limit);
+          pending.extend_from_slice(&bytes);
+          Ok(chunk.into())
+        } else {
+          Ok(bytes.into())
+        }
+      } else {
+        let body = loop {
+          match &mut *reader {
+            NodeHttpFetchResponseReader::BodyReader(reader) => break reader,
+            NodeHttpFetchResponseReader::Start(_) => {}
+            NodeHttpFetchResponseReader::FrameReader(_) => unreachable!(),
+          }
+
+          match std::mem::take(&mut *reader) {
+            NodeHttpFetchResponseReader::Start(resp) => {
+              let stream: BytesStream = Box::pin(
+                resp
+                  .into_body()
+                  .into_data_stream()
+                  .map(|r| r.map_err(std::io::Error::other)),
+              );
+              *reader =
+                NodeHttpFetchResponseReader::BodyReader(stream.peekable());
+            }
+            NodeHttpFetchResponseReader::BodyReader(_) => unreachable!(),
+            NodeHttpFetchResponseReader::FrameReader(_) => unreachable!(),
+          }
+        };
+        let fut = async move {
+          let mut reader = Pin::new(body);
+          loop {
+            match reader.as_mut().peek_mut().await {
+              Some(Ok(chunk)) if !chunk.is_empty() => {
+                let len = min(limit, chunk.len());
+                let chunk = chunk.split_to(len);
+                break Ok(chunk.into());
+              }
+              // This unwrap is safe because `peek_mut()` returned `Some`, and thus
+              // currently has a peeked value that can be synchronously returned
+              // from `next()`.
+              //
+              // The future returned from `next()` is always ready, so we can
+              // safely call `await` on it without creating a race condition.
+              Some(_) => match reader.as_mut().next().await.unwrap() {
+                Ok(chunk) => assert!(chunk.is_empty()),
+                Err(err) => break Err(JsErrorBox::type_error(err.to_string())),
+              },
+              None => break Ok(BufView::empty()),
+            }
+          }
+        };
+
+        let cancel_handle = RcRef::map(self, |r| &r.cancel);
+        fut.try_or_cancel(cancel_handle).await
+      }
     })
   }
 

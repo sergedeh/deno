@@ -8,6 +8,7 @@ import http, {
   type RequestOptions,
   ServerResponse,
 } from "node:http";
+import { pipeline, Writable } from "node:stream";
 import url from "node:url";
 import https from "node:https";
 import zlib from "node:zlib";
@@ -1963,6 +1964,61 @@ Deno.test("[node/http] supports proxy http request", async () => {
   }
   await promise;
   await server.finished;
+});
+
+Deno.test("[node/http] emits one data event per chunk", async () => {
+  const chunks = ["0", "1", "2", "3", "4"];
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "transfer-encoding": "chunked" });
+    for (const c of chunks) res.write(c);
+    res.end();
+  });
+  server.listen(0, () => {
+    const { port } = server.address() as { port: number };
+    http.get(`http://127.0.0.1:${port}`, (res) => {
+      const received: string[] = [];
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => received.push(chunk));
+      res.on("end", () => {
+        assertEquals(received, chunks);
+        server.close();
+        resolve();
+      });
+    }).end();
+  });
+  await promise;
+});
+
+Deno.test("[node/http] pipeline abort closes stream", async () => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "transfer-encoding": "chunked" });
+    for (let i = 0; i < 20; i++) res.write(String(i));
+    res.end();
+  });
+  server.listen(0, () => {
+    const { port } = server.address() as { port: number };
+    http.get(`http://127.0.0.1:${port}`, (res) => {
+      let i = 0;
+      pipeline(
+        res,
+        new Writable({
+          write(_chunk, _enc, cb) {
+            if (++i === 10) cb(new Error("kaboom"));
+            else cb();
+          },
+        }),
+        (err) => {
+          assert(err);
+          assertEquals(err?.message, "kaboom");
+          server.close();
+          resolve();
+        },
+      );
+    }).end();
+  });
+  await promise;
 });
 
 Deno.test("[node/http] `request` requires net permission to host and port", {
